@@ -35,6 +35,11 @@
 #endif
 
 #define CYCLE_DELAY_MS 250
+#define CMD_NAME_MAX_CHARS 7
+#define HUB_POWER_SWITCHING_MASK 0x3u
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+#define CMD_SCANF_FMT "%" STR(CMD_NAME_MAX_CHARS) "s %d %d"
 
 typedef struct {
   bool mounted;
@@ -96,10 +101,10 @@ void loop() {
       return;
     }
 
-    char cmd[8] = { 0 };
+    char cmd[CMD_NAME_MAX_CHARS + 1] = { 0 };
     int hub_addr = 0;
     int port = 0;
-    int args = sscanf(line.c_str(), "%7s %d %d", cmd, &hub_addr, &port);
+    int args = sscanf(line.c_str(), CMD_SCANF_FMT, cmd, &hub_addr, &port);
 
     if (args == 3 && hub_addr > 0 && hub_addr <= CFG_TUH_DEVICE_MAX && port > 0) {
       if (!strcmp(cmd, "on")) {
@@ -220,7 +225,7 @@ static void hub_desc_complete(tuh_xfer_t* xfer) {
 
   hub->mounted = true;
   hub->port_count = hub->desc.bNbrPorts;
-  hub->individual_power = (characteristics & 0x3u) == HUB_CHARS_POWER_INDIVIDUAL_SWITCHING;
+  hub->individual_power = (characteristics & HUB_POWER_SWITCHING_MASK) == HUB_CHARS_POWER_INDIVIDUAL_SWITCHING;
 
   Serial1.printf("Hub mounted at address %u with %u ports (%s power switching)\r\n",
                  xfer->daddr,

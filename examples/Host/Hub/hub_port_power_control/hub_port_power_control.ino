@@ -39,6 +39,24 @@
 #define HOST_SERIAL Serial1
 #define HOST_BAUD   115200
 
+// USB 2.0 hub descriptor type (TinyUSB doesn't expose a public constant for this)
+static const uint8_t HUB_DESC_TYPE = 0x29;
+static const uint8_t MAX_PORT_NUMBER = 255;       // Prevent overflow before casting to uint8_t
+static const uint8_t INPUT_BUFFER_SIZE = 32;
+
+// Static setup packet lives for the duration of queued control transfers.
+static const tusb_control_request_t hub_get_desc_request = {
+  .bmRequestType_bit = {
+    .recipient = TUSB_REQ_RCPT_DEVICE,
+    .type      = TUSB_REQ_TYPE_CLASS,
+    .direction = TUSB_DIR_IN
+  },
+  .bRequest = HUB_REQUEST_GET_DESCRIPTOR,
+  .wValue   = (uint16_t) (HUB_DESC_TYPE << 8), // HUB descriptor type in high byte
+  .wIndex   = 0,
+  .wLength  = sizeof(hub_desc_cs_t)
+};
+
 //--------------------------------------------------------------------+
 // Optional board helpers (PIO-USB + VBUS enable)
 //--------------------------------------------------------------------+
@@ -50,7 +68,8 @@
   #define PIN_USB_HOST_DP 16
   #endif
 
-  // Pin that enables 5V to the downstream port (if your board has it)
+  // Pin that enables 5V to the downstream port (if your board has it).
+  // Set PIN_5V_EN_STATE to the logic level that turns the VBUS switch ON.
   #ifndef PIN_5V_EN
   #define PIN_5V_EN 18
   #endif
@@ -79,7 +98,8 @@ Adafruit_USBH_Host USBHost;
 
 static uint8_t hub_addr = 0;
 static uint8_t hub_ports = 0;
-static hub_desc_cs_t hub_descriptor = { 0 };
+static hub_desc_cs_t hub_desc = { 0 };
+// Per-address storage to avoid overlapping descriptor reads when multiple devices enumerate.
 static tusb_desc_device_t device_descs[CFG_TUH_DEVICE_MAX] = { 0 };
 
 enum ControlAction : uint8_t {
@@ -89,8 +109,9 @@ enum ControlAction : uint8_t {
   ACTION_STATUS    = 3
 };
 
-static char input_line[32] = { 0 };
+static char input_line[INPUT_BUFFER_SIZE] = { 0 };
 static uint8_t input_len = 0;
+static bool discarding_line = false;
 
 static uintptr_t encode_action(ControlAction action, uint8_t port) {
   return (uintptr_t) ((action << 8) | port);
@@ -104,11 +125,21 @@ static uint8_t decode_port(uintptr_t value) {
   return (uint8_t) (value & 0xff);
 }
 
+static inline bool is_whitespace(char c) {
+  return c == ' ' || c == '\t';
+}
+
+static inline bool is_valid_device_address(uint8_t daddr) {
+  return daddr > 0 && daddr <= CFG_TUH_DEVICE_MAX;
+}
+
 //--------------------------------------------------------------------+
 // Forward declarations
 //--------------------------------------------------------------------+
 void print_help(void);
 void handle_command(const char *line);
+bool parse_port(const char *arg_start, uint8_t *out_port);
+bool command_match(const char *line, const char *cmd, const char **arg_start);
 bool queue_hub_descriptor(uint8_t daddr);
 void device_descriptor_complete(tuh_xfer_t *xfer);
 void hub_descriptor_complete(tuh_xfer_t *xfer);
@@ -132,10 +163,16 @@ void setup() {
 
 void loop() {
   USBHost.task();
-  HOST_SERIAL.flush();
 
   while (HOST_SERIAL.available()) {
     char ch = HOST_SERIAL.read();
+    if (discarding_line) {
+      if (ch == '\n' || ch == '\r') {
+        discarding_line = false;
+      }
+      continue;
+    }
+
     if (ch == '\r' || ch == '\n') {
       if (input_len) {
         input_line[input_len] = '\0';
@@ -144,6 +181,10 @@ void loop() {
       }
     } else if (input_len < sizeof(input_line) - 1) {
       input_line[input_len++] = ch;
+    } else {
+      HOST_SERIAL.println("Input too long, discarding remaining input.");
+      input_len = 0;
+      discarding_line = true;
     }
   }
 }
@@ -158,6 +199,7 @@ void print_help(void) {
   HOST_SERIAL.println("  status <port>    - query port power/connection state");
   HOST_SERIAL.println("  on <port>        - turn port power on");
   HOST_SERIAL.println("  off <port>       - turn port power off");
+  HOST_SERIAL.println("  help             - show this help");
   HOST_SERIAL.println();
   HOST_SERIAL.println("Tip: connect your USB hub to the host port first.");
 }
@@ -190,7 +232,7 @@ static void request_port_status(uint8_t port) {
 
   if (!hub_port_get_status(hub_addr, port, NULL, port_status_complete,
                            encode_action(ACTION_STATUS, port))) {
-    HOST_SERIAL.println("Unable to queue port status request (bus busy?)");
+    HOST_SERIAL.println("Failed to queue port status request.");
   }
 }
 
@@ -212,7 +254,14 @@ static void set_port_power(uint8_t port, bool enable) {
 }
 
 void handle_command(const char *line) {
-  if (!strcmp(line, "ports")) {
+  const char *args = NULL;
+
+  if (command_match(line, "help", &args)) {
+    print_help();
+    return;
+  }
+
+  if (command_match(line, "ports", &args)) {
     if (hub_addr == 0) {
       HOST_SERIAL.println("No hub detected.");
     } else if (hub_ports == 0) {
@@ -224,28 +273,83 @@ void handle_command(const char *line) {
     return;
   }
 
-  if (!strncmp(line, "status", 6)) {
-    uint8_t port = (uint8_t) atoi(line + 6);
-    request_port_status(port);
+  if (command_match(line, "status", &args)) {
+    uint8_t port = 0;
+    if (parse_port(args, &port)) {
+      request_port_status(port);
+    }
     return;
   }
 
-  if (!strncmp(line, "on", 2)) {
-    uint8_t port = (uint8_t) atoi(line + 2);
-    set_port_power(port, true);
+  if (command_match(line, "on", &args)) {
+    uint8_t port = 0;
+    if (parse_port(args, &port)) {
+      set_port_power(port, true);
+    }
     return;
   }
 
-  if (!strncmp(line, "off", 3)) {
-    uint8_t port = (uint8_t) atoi(line + 3);
-    set_port_power(port, false);
+  if (command_match(line, "off", &args)) {
+    uint8_t port = 0;
+    if (parse_port(args, &port)) {
+      set_port_power(port, false);
+    }
     return;
   }
 
-  HOST_SERIAL.println("Unknown command. Type any command without args to reprint help.");
+  HOST_SERIAL.println("Unknown command. Type 'help' to see available commands.");
 }
 
-static void print_port_status(uint8_t port, const hub_port_status_response_t &ps) {
+bool parse_port(const char *arg_start, uint8_t *out_port) {
+  while (is_whitespace(*arg_start)) arg_start++;
+  if (!*arg_start) {
+    HOST_SERIAL.println("Please provide a port number (1..n).");
+    return false;
+  }
+
+  char *endptr = NULL;
+  long value = strtol(arg_start, &endptr, 10);
+  if (endptr == arg_start) {
+    HOST_SERIAL.println("Invalid port number. Use digits like '1' or '2'.");
+    return false;
+  }
+
+  while (is_whitespace(*endptr)) endptr++;
+  if (*endptr != '\0') {
+    HOST_SERIAL.println("Unexpected characters after the port number.");
+    return false;
+  }
+
+  if (value <= 0) {
+    HOST_SERIAL.println("Port numbers start at 1.");
+    return false;
+  }
+
+  if (value > MAX_PORT_NUMBER) {
+    HOST_SERIAL.printf("Port number too large (max %u).\r\n", MAX_PORT_NUMBER);
+    return false;
+  }
+
+  *out_port = (uint8_t) value;
+  return true;
+}
+
+bool command_match(const char *line, const char *cmd, const char **arg_start) {
+  size_t len = strlen(cmd);
+  if (strncmp(line, cmd, len) != 0) {
+    return false;
+  }
+
+  char next = line[len];
+  if (next == '\0' || is_whitespace(next)) {
+    *arg_start = line + len;
+    return true;
+  }
+
+  return false;
+}
+
+static void print_port_status(uint8_t port, hub_port_status_response_t ps) {
   const char *speed = "FS";
   if (ps.status.high_speed)      speed = "HS";
   else if (ps.status.low_speed)  speed = "LS";
@@ -255,7 +359,7 @@ static void print_port_status(uint8_t port, const hub_port_status_response_t &ps
                      ps.status.port_power ? "ON" : "OFF",
                      ps.status.port_enable ? "yes" : "no",
                      ps.status.connection ? "yes" : "no",
-                     ps.status.over_current ? "YES" : "no",
+                     ps.status.over_current ? "yes" : "no",
                      ps.status.reset ? "yes" : "no",
                      speed);
 }
@@ -264,6 +368,7 @@ static void print_port_status(uint8_t port, const hub_port_status_response_t &ps
 // USB Host callbacks
 //--------------------------------------------------------------------+
 void tuh_mount_cb(uint8_t daddr) {
+  if (!is_valid_device_address(daddr)) return;
   tusb_desc_device_t *desc = &device_descs[daddr - 1];
 
   if (!tuh_descriptor_get_device(daddr, desc, sizeof(tusb_desc_device_t), device_descriptor_complete, 0)) {
@@ -276,7 +381,7 @@ void tuh_umount_cb(uint8_t daddr) {
   if (daddr == hub_addr) {
     hub_addr = 0;
     hub_ports = 0;
-    memset(&hub_descriptor, 0, sizeof(hub_descriptor));
+    memset(&hub_desc, 0, sizeof(hub_desc));
     HOST_SERIAL.println("Hub disconnected. Reconnect to continue.");
   }
 }
@@ -285,23 +390,11 @@ void tuh_umount_cb(uint8_t daddr) {
 // Control transfer helpers
 //--------------------------------------------------------------------+
 bool queue_hub_descriptor(uint8_t daddr) {
-  tusb_control_request_t const request = {
-    .bmRequestType_bit = {
-      .recipient = TUSB_REQ_RCPT_DEVICE,
-      .type      = TUSB_REQ_TYPE_CLASS,
-      .direction = TUSB_DIR_IN
-    },
-    .bRequest = HUB_REQUEST_GET_DESCRIPTOR,
-    .wValue   = 0,
-    .wIndex   = 0,
-    .wLength  = sizeof(hub_descriptor)
-  };
-
   tuh_xfer_t xfer = {
     .daddr       = daddr,
     .ep_addr     = 0,
-    .setup       = &request,
-    .buffer      = &hub_descriptor,
+    .setup       = &hub_get_desc_request,
+    .buffer      = &hub_desc,
     .complete_cb = hub_descriptor_complete,
     .user_data   = 0
   };
@@ -316,6 +409,7 @@ void device_descriptor_complete(tuh_xfer_t *xfer) {
   }
 
   uint8_t daddr = xfer->daddr;
+  if (!is_valid_device_address(daddr)) return;
   tusb_desc_device_t *desc = &device_descs[daddr - 1];
 
   if (desc->bDeviceClass == TUSB_CLASS_HUB) {
@@ -335,12 +429,13 @@ void hub_descriptor_complete(tuh_xfer_t *xfer) {
   }
 
   uint8_t daddr = xfer->daddr;
+  if (!is_valid_device_address(daddr)) return;
   tusb_desc_device_t *desc = &device_descs[daddr - 1];
 
   if (desc->bDeviceClass != TUSB_CLASS_HUB) return;
 
   hub_addr = daddr;
-  hub_ports = hub_descriptor.bNbrPorts;
+  hub_ports = hub_desc.bNbrPorts;
   HOST_SERIAL.printf("Hub detected on address %u with %u port(s)\r\n", hub_addr, hub_ports);
   HOST_SERIAL.println("Use `status <port>`, `on <port>`, or `off <port>`.");
 }

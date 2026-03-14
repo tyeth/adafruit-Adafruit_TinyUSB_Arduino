@@ -233,6 +233,7 @@ void get_hub_descriptor(uint8_t hub_addr) {
   request.bmRequestType_bit.type      = TUSB_REQ_TYPE_CLASS;
   request.bmRequestType_bit.direction = TUSB_DIR_IN;
   request.bRequest = HUB_REQUEST_GET_DESCRIPTOR;
+  // wValue = 0 follows TinyUSB's internal hub driver convention (hub.c hub_set_config)
   request.wValue   = 0;
   request.wIndex   = 0;
   request.wLength  = sizeof(hub_desc_cs_t);
@@ -286,9 +287,10 @@ void cmd_status(void) {
       status_hub_idx = i;
       status_port = 1;
 
-      // Note: NULL buffer is safe here because hub_port_get_status() for
-      // port != 0 uses the hub driver's internal buffer. Use
-      // hub_port_get_status_local() in the callback to read the result.
+      // Note: NULL buffer is safe for specific port queries (port >= 1)
+      // because hub_port_get_status() redirects to the hub driver's
+      // internal buffer. Use hub_port_get_status_local() in the
+      // callback to read the cached result.
       xfer_pending = true;
       if (!hub_port_get_status(hub_addr, 1, NULL, port_status_complete, 0)) {
         SerialConsole.println("  Failed to get port 1 status");

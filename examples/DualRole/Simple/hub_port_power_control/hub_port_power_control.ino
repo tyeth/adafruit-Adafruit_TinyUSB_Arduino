@@ -75,7 +75,7 @@ static void print_help(void) {
 
 static void print_hub_summary(void) {
   if (!hub_info.ready) {
-    Serial.println("No powered hub descriptor available yet.");
+    Serial.println("No hub descriptor available yet.");
     return;
   }
 

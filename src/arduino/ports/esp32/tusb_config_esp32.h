@@ -66,7 +66,12 @@ extern "C" {
 #define CFG_TUSB_MCU OPT_MCU_ESP32
 #endif
 
-#if CONFIG_IDF_TARGET_ESP32P4
+// ESP32-P4 has two device controllers: OTG HS (ARDUINO_USB_PORT 0, the
+// default) and OTG FS on the USB Serial/JTAG pins (ARDUINO_USB_PORT 1, e.g.
+// the core's USBMode=tinyusb_fs). Descriptors must match the selected port:
+// 512-byte bulk endpoints on the FS controller make SET_CONFIGURATION fail.
+#if CONFIG_IDF_TARGET_ESP32P4 &&                                              \
+    (!defined(ARDUINO_USB_PORT) || ARDUINO_USB_PORT == 0)
 #define CFG_TUD_MAX_SPEED OPT_MODE_HIGH_SPEED
 #else
 #define CFG_TUD_MAX_SPEED OPT_MODE_FULL_SPEED

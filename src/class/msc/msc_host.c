@@ -332,6 +332,25 @@ void msch_close(uint8_t dev_addr) {
   tu_memclr(p_msc, sizeof(msch_interface_t));
 }
 
+// Complete the pending command with a failed CSW so the caller's complete_cb always runs, instead of leaving the
+// command pending forever (e.g. a stale device address after a disconnect the root port never saw)
+static void msch_complete_failed(uint8_t dev_addr, msch_interface_t* p_msc, msc_cbw_t const* cbw, msc_csw_t* csw) {
+  csw->signature    = MSC_CSW_SIGNATURE;
+  csw->tag          = cbw->tag;
+  csw->data_residue = cbw->total_bytes;
+  csw->status       = MSC_CSW_STATUS_FAILED;
+  p_msc->stage      = MSC_STAGE_IDLE;
+  if (p_msc->complete_cb != NULL) {
+    tuh_msc_complete_data_t const cb_data = {
+        .cbw = cbw,
+        .csw = csw,
+        .scsi_data = p_msc->buffer,
+        .user_arg = p_msc->complete_arg
+    };
+    (void) p_msc->complete_cb(dev_addr, &cb_data);
+  }
+}
+
 bool msch_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t event, uint32_t xferred_bytes) {
   msch_interface_t* p_msc = get_itf(dev_addr);
   msch_epbuf_t* epbuf = get_epbuf(dev_addr);
@@ -341,29 +360,39 @@ bool msch_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t event, uint32
   switch (p_msc->stage) {
     case MSC_STAGE_CMD:
       // Must be Command Block
-      TU_ASSERT(ep_addr == p_msc->ep_out && event == XFER_RESULT_SUCCESS && xferred_bytes == sizeof(msc_cbw_t));
+      if (!(ep_addr == p_msc->ep_out && event == XFER_RESULT_SUCCESS && xferred_bytes == sizeof(msc_cbw_t))) {
+        msch_complete_failed(dev_addr, p_msc, cbw, csw);
+        return true;
+      }
       if (cbw->total_bytes && p_msc->buffer) {
         // Data stage if any
         p_msc->stage = MSC_STAGE_DATA;
         p_msc->data_xferred = 0;
-        TU_ASSERT(data_stage_xfer(dev_addr, p_msc, cbw));
+        if (!data_stage_xfer(dev_addr, p_msc, cbw)) { msch_complete_failed(dev_addr, p_msc, cbw, csw); return true; }
       } else {
-        TU_ASSERT(status_stage_xfer(dev_addr, p_msc, csw));
+        if (!status_stage_xfer(dev_addr, p_msc, csw)) { msch_complete_failed(dev_addr, p_msc, cbw, csw); return true; }
       }
       break;
 
     case MSC_STAGE_DATA:
+      if (event == XFER_RESULT_FAILED) {
+        msch_complete_failed(dev_addr, p_msc, cbw, csw);
+        return true;
+      }
       p_msc->data_xferred += xferred_bytes;
       if (event == XFER_RESULT_SUCCESS && xferred_bytes == MSCH_DATA_XFER_MAX &&
           p_msc->data_xferred < cbw->total_bytes) {
-        TU_ASSERT(data_stage_xfer(dev_addr, p_msc, cbw));
+        if (!data_stage_xfer(dev_addr, p_msc, cbw)) { msch_complete_failed(dev_addr, p_msc, cbw, csw); return true; }
       } else {
-        TU_ASSERT(status_stage_xfer(dev_addr, p_msc, csw));
+        if (!status_stage_xfer(dev_addr, p_msc, csw)) { msch_complete_failed(dev_addr, p_msc, cbw, csw); return true; }
       }
       break;
 
     case MSC_STAGE_STATUS:
       // SCSI op is complete
+      if (event != XFER_RESULT_SUCCESS) {
+        csw->status = MSC_CSW_STATUS_FAILED;
+      }
       p_msc->stage = MSC_STAGE_IDLE;
       if (p_msc->complete_cb != NULL) {
         tuh_msc_complete_data_t const cb_data = {
